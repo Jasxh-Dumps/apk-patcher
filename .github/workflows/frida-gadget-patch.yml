@@ -31,16 +31,19 @@ jobs:
       # ── apktool 3.0.1 ─────────────────────────────────────────────────────────
       - name: Install apktool 3.0.1
         run: |
-          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.1/apktool_3.0.1.jar -O apktool.jar
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.1/apktool_3.0.1.jar \
+               -O apktool.jar
           sudo mv apktool.jar /usr/local/bin/apktool.jar
-          printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' | sudo tee /usr/local/bin/apktool > /dev/null
+          printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' \
+               | sudo tee /usr/local/bin/apktool > /dev/null
           sudo chmod +x /usr/local/bin/apktool
           apktool --version
 
       # ── Android build-tools (zipalign + apksigner) ────────────────────────────
       - name: Install Android cmdline-tools & build-tools
         run: |
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip -O cmdline.zip
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip \
+               -O cmdline.zip
           unzip -q cmdline.zip -d cmdline-tools
           mkdir -p ~/android-sdk/cmdline-tools/latest
           mv cmdline-tools/cmdline-tools/* ~/android-sdk/cmdline-tools/latest/
@@ -53,6 +56,8 @@ jobs:
         run: npm install -g apk-mitm
 
       # ── STEP 1: apk-mitm → strip certificate pinning ──────────────────────────
+      # apk-mitm v1.3.0 ignores --output; it always saves "<name>-patched.apk"
+      # next to the source file. We find it with `find` after the run.
       - name: Run apk-mitm on original APK
         run: |
           apk-mitm original.apk --apktool /usr/local/bin/apktool.jar
@@ -78,24 +83,27 @@ jobs:
             || echo "17.7.3")
           echo "Frida version: $FRIDA_VERSION"
           echo "FRIDA_VERSION=$FRIDA_VERSION" >> $GITHUB_ENV
-          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm64.so.xz" -o frida-arm64.so.xz
+          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm64.so.xz" \
+               -o frida-arm64.so.xz
           unxz frida-arm64.so.xz
           mkdir -p decoded/lib/arm64-v8a
-          mv frida-gadget-*arm64*.so decoded/lib/arm64-v8a/libfrida-gadget.so
+          mv frida-arm64.so decoded/lib/arm64-v8a/libfrida-gadget.so
           ls -lh decoded/lib/arm64-v8a/libfrida-gadget.so
 
       # ── STEP 3b: Frida gadget (armeabi-v7a) ───────────────────────────────────
       - name: Download Frida gadget (armeabi-v7a)
         run: |
-          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm.so.xz" -o frida-arm.so.xz || true
+          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm.so.xz" \
+               -o frida-arm.so.xz || true
           if [ -f frida-arm.so.xz ]; then
             unxz frida-arm.so.xz
             mkdir -p decoded/lib/armeabi-v7a
-            mv frida-gadget-*arm.so decoded/lib/armeabi-v7a/libfrida-gadget.so
+            mv frida-arm.so decoded/lib/armeabi-v7a/libfrida-gadget.so
             echo "arm gadget placed"
           fi
 
       # ── STEP 4: No-pause config ────────────────────────────────────────────────
+      # Written inline — no need for a repo file
       - name: Write Frida no-pause config
         run: |
           cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so << 'JSON'
@@ -108,6 +116,7 @@ jobs:
             }
           }
           JSON
+          # Also place in armeabi-v7a if it exists
           if [ -d decoded/lib/armeabi-v7a ]; then
             cp decoded/lib/arm64-v8a/libfrida-gadget.config.so decoded/lib/armeabi-v7a/
           fi
@@ -201,7 +210,6 @@ jobs:
           PYEOF
 
       # Remaining steps unchanged...
-
       # ── STEP 6: Manifest ──────────────────────────────────────────────────────
       - name: Patch AndroidManifest.xml
         run: |
