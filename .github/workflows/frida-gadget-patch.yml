@@ -2,6 +2,11 @@ name: Frida Gadget Auto-Patch (No Pause)
 
 on:
   workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct APK download URL (leave empty to use original.apk from repo)'
+        required: false
+        default: ''
   push:
     branches: [ main ]
     paths:
@@ -55,9 +60,24 @@ jobs:
       - name: Install apk-mitm
         run: npm install -g apk-mitm
 
+      # ── Resolve APK source: URL input OR repo file ────────────────────────────
+      - name: Prepare input APK
+        run: |
+          APK_URL="${{ github.event.inputs.apk_url }}"
+          if [ -n "$APK_URL" ]; then
+            echo "Downloading APK from URL: $APK_URL"
+            curl -L "$APK_URL" -o original.apk
+            echo "Downloaded: $(ls -lh original.apk)"
+          else
+            echo "No URL provided — using original.apk from repo"
+            if [ ! -f original.apk ]; then
+              echo "ERROR: original.apk not found in repo and no URL supplied"
+              exit 1
+            fi
+            echo "Using repo file: $(ls -lh original.apk)"
+          fi
+
       # ── STEP 1: apk-mitm → strip certificate pinning ──────────────────────────
-      # apk-mitm v1.3.0 ignores --output; it always saves "<name>-patched.apk"
-      # next to the source file. We find it with `find` after the run.
       - name: Run apk-mitm on original APK
         run: |
           apk-mitm original.apk --apktool /usr/local/bin/apktool.jar
@@ -103,7 +123,6 @@ jobs:
           fi
 
       # ── STEP 4: No-pause config ────────────────────────────────────────────────
-      # Written inline — no need for a repo file
       - name: Write Frida no-pause config
         run: |
           cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so << 'JSON'
@@ -116,7 +135,6 @@ jobs:
             }
           }
           JSON
-          # Also place in armeabi-v7a if it exists
           if [ -d decoded/lib/armeabi-v7a ]; then
             cp decoded/lib/arm64-v8a/libfrida-gadget.config.so decoded/lib/armeabi-v7a/
           fi
