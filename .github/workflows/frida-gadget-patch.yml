@@ -45,7 +45,10 @@ jobs:
 
       - name: Download latest Frida gadget (arm64-v8a)
         run: |
-          FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          # Step 1: Get clean version number
+          FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' | head -n 1)
+          echo "Latest Frida version: $FRIDA_VERSION"
+          # Should print: Latest Frida version: 17.7.3
           wget "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm64.so.xz"
           unxz frida-gadget-*.xz
           mkdir -p decoded/lib/arm64-v8a
