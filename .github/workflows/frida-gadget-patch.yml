@@ -1,11 +1,11 @@
 name: Frida Gadget Auto-Patch (No Pause)
 
 on:
-  workflow_dispatch:          # Run manually from Actions tab
+  workflow_dispatch:
   push:
     branches: [ main ]
     paths:
-      - 'original.apk'        # Triggers when you update the base APK
+      - 'original.apk'
 
 jobs:
   patch-apk:
@@ -15,68 +15,224 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── Java ──────────────────────────────────────────────────────────────────
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install apktool
-        run: |
-          wget https://github.com/iBotPeaches/Apktool/releases/download/v3.0.1/apktool_3.0.1.jar -O apktool.jar
-          sudo mv apktool.jar /usr/local/bin/apktool.jar
-          echo '#!/bin/bash' | sudo tee /usr/local/bin/apktool
-          echo 'java -jar /usr/local/bin/apktool.jar "$@"' | sudo tee -a /usr/local/bin/apktool
-          sudo chmod +x /usr/local/bin/apktool
+      # ── Node.js (required by apk-mitm) ────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Install Android build-tools (zipalign, apksigner)
+      # ── apktool 3.0.1 ─────────────────────────────────────────────────────────
+      - name: Install apktool 3.0.1
         run: |
-          wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline.zip
-          unzip cmdline.zip -d cmdline-tools
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.1/apktool_3.0.1.jar \
+               -O apktool.jar
+          sudo mv apktool.jar /usr/local/bin/apktool.jar
+          printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' \
+               | sudo tee /usr/local/bin/apktool > /dev/null
+          sudo chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      # ── Android build-tools (zipalign + apksigner) ────────────────────────────
+      - name: Install Android cmdline-tools & build-tools
+        run: |
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip \
+               -O cmdline.zip
+          unzip -q cmdline.zip -d cmdline-tools
           mkdir -p ~/android-sdk/cmdline-tools/latest
           mv cmdline-tools/cmdline-tools/* ~/android-sdk/cmdline-tools/latest/
-          yes | ~/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
-          ~/android-sdk/cmdline-tools/latest/bin/sdkmanager "build-tools;36.0.0" "platform-tools"
-          echo "$HOME/android-sdk/build-tools/36.0.0" >> $GITHUB_PATH
+          yes | ~/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1
+          ~/android-sdk/cmdline-tools/latest/bin/sdkmanager "build-tools;35.0.0" "platform-tools"
+          echo "$HOME/android-sdk/build-tools/35.0.0" >> $GITHUB_PATH
 
-      - name: Decompile APK
-        run: |
-          apktool d original.apk -f -o decoded
+      # ── apk-mitm ──────────────────────────────────────────────────────────────
+      - name: Install apk-mitm
+        run: npm install -g apk-mitm
 
-      - name: Download latest Frida gadget (arm64-v8a)
+      # ── STEP 1: apk-mitm → strip certificate pinning ──────────────────────────
+      # apk-mitm v1.3.0 ignores --output; it always saves "<name>-patched.apk"
+      # next to the source file. We find it with `find` after the run.
+      - name: Run apk-mitm on original APK
         run: |
-          # Step 1: Get clean version number
-          FRIDA_VERSION=$(curl -s https://api.github.com/repos/frida/frida/releases/latest | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' | head -n 1)
-          echo "Latest Frida version: $FRIDA_VERSION"
-          # Should print: Latest Frida version: 17.7.3
-          wget "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm64.so.xz"
-          unxz frida-gadget-*.xz
+          apk-mitm original.apk --apktool /usr/local/bin/apktool.jar
+          MITM_OUT=$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name "*patched*.apk" | head -1)
+          if [ -z "$MITM_OUT" ]; then
+            echo "ERROR: apk-mitm output not found"
+            exit 1
+          fi
+          echo "apk-mitm output: $MITM_OUT"
+          echo "MITM_OUT=$MITM_OUT" >> $GITHUB_ENV
+
+      # ── STEP 2: Decompile ─────────────────────────────────────────────────────
+      - name: Decompile mitm-patched APK
+        run: |
+          apktool d "$MITM_OUT" -f -o decoded
+
+      # ── STEP 3: Frida gadget (arm64-v8a) ──────────────────────────────────────
+      - name: Download Frida gadget (arm64-v8a)
+        run: |
+          FRIDA_VERSION=$(curl -sf https://api.github.com/repos/frida/frida/releases/latest \
+            | grep '"tag_name":' \
+            | sed -E 's/.*"tag_name":\s*"v?([^"]+)".*/\1/' \
+            || echo "17.7.3")
+          echo "Frida version: $FRIDA_VERSION"
+          echo "FRIDA_VERSION=$FRIDA_VERSION" >> $GITHUB_ENV
+          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm64.so.xz" \
+               -o frida-arm64.so.xz
+          unxz frida-arm64.so.xz
           mkdir -p decoded/lib/arm64-v8a
-          mv frida-gadget-*.so decoded/lib/arm64-v8a/libfrida-gadget.so
+          mv frida-gadget-*arm64*.so decoded/lib/arm64-v8a/libfrida-gadget.so
+          ls -lh decoded/lib/arm64-v8a/libfrida-gadget.so
 
-      - name: Add no-pause config file
+      # ── STEP 3b: Frida gadget (armeabi-v7a) ───────────────────────────────────
+      - name: Download Frida gadget (armeabi-v7a)
         run: |
-          cp libfrida-gadget.config.so decoded/lib/arm64-v8a/
-
-      - name: Force extractNativeLibs=true & add INTERNET permission
-        run: |
-          sed -i 's/android:extractNativeLibs="false"/android:extractNativeLibs="true"/g' decoded/AndroidManifest.xml || \
-          sed -i '/<application /s:/> : android:extractNativeLibs="true">:' decoded/AndroidManifest.xml
-
-          if ! grep -q 'android.permission.INTERNET' decoded/AndroidManifest.xml; then
-            sed -i '/<\/manifest>/i \    <uses-permission android:name="android.permission.INTERNET" />' decoded/AndroidManifest.xml
+          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm.so.xz" \
+               -o frida-arm.so.xz || true
+          if [ -f frida-arm.so.xz ]; then
+            unxz frida-arm.so.xz
+            mkdir -p decoded/lib/armeabi-v7a
+            mv frida-gadget-*arm.so decoded/lib/armeabi-v7a/libfrida-gadget.so
+            echo "arm gadget placed"
           fi
 
+      # ── STEP 4: No-pause config ────────────────────────────────────────────────
+      # Written inline — no need for a repo file
+      - name: Write Frida no-pause config
+        run: |
+          cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so << 'JSON'
+          {
+            "interaction": {
+              "type": "listen",
+              "address": "127.0.0.1",
+              "port": 27042,
+              "on_load": "resume"
+            }
+          }
+          JSON
+          # Also place in armeabi-v7a if it exists
+          if [ -d decoded/lib/armeabi-v7a ]; then
+            cp decoded/lib/arm64-v8a/libfrida-gadget.config.so decoded/lib/armeabi-v7a/
+          fi
+          echo "Config written."
+
+      # ── STEP 5: Smali injection ────────────────────────────────────────────────
+      - name: Install androguard
+        run: pip install androguard --quiet
+
+      - name: Auto-inject System.loadLibrary into Smali
+        run: |
+          python3 /dev/stdin << 'PYEOF'
+import os, sys
+from androguard.core.apk import APK
+
+DECODED  = "decoded"
+APK_PATH = os.environ["MITM_OUT"]
+
+apk = APK(APK_PATH)
+
+def smali_path(class_name, decoded_dir):
+    rel = class_name.replace(".", "/").lstrip("/") + ".smali"
+    for root, dirs, files in os.walk(decoded_dir):
+        candidate = os.path.join(root, rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+# Prefer Application class, fall back to main Activity
+target_class = apk.get_attribute_value("application", "name") or ""
+target_path  = smali_path(target_class, DECODED) if target_class else None
+
+if not target_path:
+    for act in apk.get_activities():
+        p = smali_path(act, DECODED)
+        if p:
+            target_class = act
+            target_path  = p
+            break
+
+if not target_path:
+    print("[-] No suitable Smali found — skipping injection")
+    print("    Activities:", apk.get_activities())
+    sys.exit(0)
+
+print(f"[+] Target: {target_path}")
+print(f"[+] Class:  {target_class}")
+
+lines = open(target_path).readlines()
+
+if 'frida-gadget' in ''.join(lines):
+    print("[*] Already injected — skipping")
+    sys.exit(0)
+
+insert_idx = -1
+i = 0
+while i < len(lines):
+    line = lines[i].strip()
+    if line.startswith(".method") and ("onCreate(" in line or "<init>" in line):
+        j = i + 1
+        while j < len(lines) and not lines[j].strip().startswith(".end method"):
+            s = lines[j].strip()
+            if s.startswith(".locals 0"):
+                lines[j] = lines[j].replace(".locals 0", ".locals 1")
+                insert_idx = j + 1
+                break
+            if "invoke-super" in s and "onCreate" in s:
+                insert_idx = j + 1
+                break
+            j += 1
+        if insert_idx == -1:
+            insert_idx = i + 1
+    if insert_idx != -1:
+        break
+    i += 1
+
+if insert_idx == -1:
+    print("[-] No insertion point found — skipping")
+    sys.exit(0)
+
+injection = [
+    '    const-string v0, "frida-gadget"\n',
+    '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n',
+]
+lines[insert_idx:insert_idx] = injection
+open(target_path, "w").writelines(lines)
+print("[+] Smali injection successful")
+PYEOF
+
+      # ── STEP 6: Manifest ──────────────────────────────────────────────────────
+      - name: Patch AndroidManifest.xml
+        run: |
+          MANIFEST="decoded/AndroidManifest.xml"
+          # extractNativeLibs false → true
+          sed -i 's/android:extractNativeLibs="false"/android:extractNativeLibs="true"/g' "$MANIFEST" || true
+          # Add flag if missing entirely
+          if ! grep -q 'extractNativeLibs' "$MANIFEST"; then
+            sed -i 's/<application /<application android:extractNativeLibs="true" /g' "$MANIFEST" || true
+          fi
+          # INTERNET permission
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i '/<\/manifest>/i \    <uses-permission android:name="android.permission.INTERNET" />' "$MANIFEST"
+          fi
+          echo "Manifest patched."
+
+      # ── STEP 7: Rebuild ───────────────────────────────────────────────────────
       - name: Rebuild APK
-        run: |
-          apktool b decoded -o repackaged-unsigned.apk
+        run: apktool b decoded -o repackaged-unsigned.apk
 
-      - name: Prepare keystore from secret
-        run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > my.keystore
-
+      # ── STEP 8: Align ─────────────────────────────────────────────────────────
       - name: Align APK
         run: zipalign -v -f 4 repackaged-unsigned.apk aligned.apk
+
+      # ── STEP 9: Sign ──────────────────────────────────────────────────────────
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > my.keystore
 
       - name: Sign APK
         env:
@@ -92,9 +248,11 @@ jobs:
             --v3-signing-enabled true \
             aligned.apk
 
+      # ── STEP 10: Verify ───────────────────────────────────────────────────────
       - name: Verify signed APK
         run: apksigner verify -v aligned.apk
 
+      # ── Upload ────────────────────────────────────────────────────────────────
       - name: Upload final patched APK
         uses: actions/upload-artifact@v4
         with:
