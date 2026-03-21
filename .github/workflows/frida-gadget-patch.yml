@@ -7,6 +7,20 @@ on:
         description: 'Direct APK download URL (leave empty to use original.apk from repo)'
         required: false
         default: ''
+      runner:
+        description: >
+          Runner label to use for this job.
+          Defaults to "ubuntu-latest" (GitHub-hosted, US region).
+          To run in India, choose one of the following options:
+          (1) Self-hosted runner: register a runner on an India-based machine
+          and pass its label here (e.g. "self-hosted" or a custom label like
+          "linux-india" that you assigned when registering the runner).
+          (2) GitHub larger hosted runner (Teams / Enterprise Cloud): create a
+          runner group in your organisation settings, set its region to
+          "Central India", assign a unique label (e.g. "ubuntu-india"), and
+          pass that label here.
+        required: false
+        default: 'ubuntu-latest'
   push:
     branches: [ main ]
     paths:
@@ -14,7 +28,9 @@ on:
 
 jobs:
   patch-apk:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
