@@ -1,283 +1,335 @@
-name: Frida Gadget Auto-Patch (No Pause)
+name: APKS Rebuild and Sign
 
 on:
   workflow_dispatch:
     inputs:
-      apk_url:
-        description: 'Direct APK download URL (leave empty to use original.apk from repo)'
+      apks_url:
+        description: "Direct APKS download URL (leave empty to use original.apks from repo)"
         required: false
-        default: ''
+        default: ""
+
   push:
-    branches: [ main ]
+    branches:
+      - main
     paths:
-      - 'original.apk'
+      - "original.apks"
 
 jobs:
-  patch-apk:
+  rebuild-apks:
     runs-on: ubuntu-latest
 
     steps:
+      # ─────────────────────────────────────────────────────────────
+      # Checkout
+      # ─────────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Java ──────────────────────────────────────────────────────────────────
+      # ─────────────────────────────────────────────────────────────
+      # Java 17
+      # ─────────────────────────────────────────────────────────────
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: temurin
+          java-version: "17"
 
-      # ── Node.js (required by apk-mitm) ────────────────────────────────────────
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      # ── apktool 3.0.1 ─────────────────────────────────────────────────────────
-      - name: Install apktool 3.0.1
+      # ─────────────────────────────────────────────────────────────
+      # Android SDK / Build Tools
+      # ─────────────────────────────────────────────────────────────
+      - name: Install Android SDK
         run: |
-          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v3.0.1/apktool_3.0.1.jar \
-               -O apktool.jar
+          wget -q \
+            https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip \
+            -O cmdline.zip
+
+          unzip -q cmdline.zip -d cmdline-tools
+
+          mkdir -p "$HOME/android-sdk/cmdline-tools/latest"
+
+          mv cmdline-tools/cmdline-tools/* \
+            "$HOME/android-sdk/cmdline-tools/latest/"
+
+          export ANDROID_HOME="$HOME/android-sdk"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager \
+            "platform-tools" \
+            "build-tools;35.0.0"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      # ─────────────────────────────────────────────────────────────
+      # Apktool
+      # ─────────────────────────────────────────────────────────────
+      - name: Install apktool
+        run: |
+          wget -q \
+            https://github.com/iBotPeaches/Apktool/releases/download/v3.0.1/apktool_3.0.1.jar \
+            -O apktool.jar
+
           sudo mv apktool.jar /usr/local/bin/apktool.jar
+
           printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' \
-               | sudo tee /usr/local/bin/apktool > /dev/null
+            | sudo tee /usr/local/bin/apktool >/dev/null
+
           sudo chmod +x /usr/local/bin/apktool
+
           apktool --version
 
-      # ── Android build-tools (zipalign + apksigner) ────────────────────────────
-      - name: Install Android cmdline-tools & build-tools
+      # ─────────────────────────────────────────────────────────────
+      # Prepare APKS
+      # ─────────────────────────────────────────────────────────────
+      - name: Prepare input APKS
+        env:
+          APKS_URL: ${{ github.event.inputs.apks_url }}
         run: |
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip \
-               -O cmdline.zip
-          unzip -q cmdline.zip -d cmdline-tools
-          mkdir -p ~/android-sdk/cmdline-tools/latest
-          mv cmdline-tools/cmdline-tools/* ~/android-sdk/cmdline-tools/latest/
-          yes | ~/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1
-          ~/android-sdk/cmdline-tools/latest/bin/sdkmanager "build-tools;35.0.0" "platform-tools"
-          echo "$HOME/android-sdk/build-tools/35.0.0" >> $GITHUB_PATH
-
-      # ── apk-mitm ──────────────────────────────────────────────────────────────
-      - name: Install apk-mitm
-        run: npm install -g apk-mitm
-
-      # ── Resolve APK source: URL input OR repo file ────────────────────────────
-      - name: Prepare input APK
-        run: |
-          APK_URL="${{ github.event.inputs.apk_url }}"
-          if [ -n "$APK_URL" ]; then
-            echo "Downloading APK from URL: $APK_URL"
-            curl -L "$APK_URL" -o original.apk
-            echo "Downloaded: $(ls -lh original.apk)"
+          if [ -n "$APKS_URL" ]; then
+            echo "Downloading APKS from URL..."
+            curl -L --fail "$APKS_URL" -o original.apks
           else
-            echo "No URL provided — using original.apk from repo"
-            if [ ! -f original.apk ]; then
-              echo "ERROR: original.apk not found in repo and no URL supplied"
+            echo "Using original.apks from repository."
+
+            if [ ! -f original.apks ]; then
+              echo "::error::original.apks not found."
               exit 1
             fi
-            echo "Using repo file: $(ls -lh original.apk)"
           fi
 
-      # ── STEP 1: apk-mitm → strip certificate pinning ──────────────────────────
-      - name: Run apk-mitm on original APK
+          echo "Input:"
+          ls -lh original.apks
+
+      # ─────────────────────────────────────────────────────────────
+      # Extract APKS
+      # ─────────────────────────────────────────────────────────────
+      - name: Extract APKS
         run: |
-          apk-mitm original.apk --apktool /usr/local/bin/apktool.jar
-          MITM_OUT=$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name "*patched*.apk" | head -1)
-          if [ -z "$MITM_OUT" ]; then
-            echo "ERROR: apk-mitm output not found"
+          rm -rf extracted
+          mkdir -p extracted
+
+          unzip -q original.apks -d extracted
+
+          echo "Extracted files:"
+          find extracted -type f -name "*.apk" -print
+
+      # ─────────────────────────────────────────────────────────────
+      # Validate split set
+      # ─────────────────────────────────────────────────────────────
+      - name: Validate APK set
+        run: |
+          APK_COUNT=$(find extracted -type f -name "*.apk" | wc -l)
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::No APK files found inside original.apks"
             exit 1
           fi
-          echo "apk-mitm output: $MITM_OUT"
-          echo "MITM_OUT=$MITM_OUT" >> $GITHUB_ENV
 
-      # ── STEP 2: Decompile ─────────────────────────────────────────────────────
-      - name: Decompile mitm-patched APK
-        run: |
-          apktool d "$MITM_OUT" -f -o decoded
+          echo "Found $APK_COUNT APK files."
 
-      # ── STEP 3: Frida gadget (arm64-v8a) ──────────────────────────────────────
-      - name: Download Frida gadget (arm64-v8a)
-        run: |
-          FRIDA_VERSION=$(curl -sf https://api.github.com/repos/frida/frida/releases/latest \
-            | grep '"tag_name":' \
-            | sed -E 's/.*"tag_name":\s*"v?([^"]+)".*/\1/' \
-            || echo "17.7.3")
-          echo "Frida version: $FRIDA_VERSION"
-          echo "FRIDA_VERSION=$FRIDA_VERSION" >> $GITHUB_ENV
-          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm64.so.xz" \
-               -o frida-arm64.so.xz
-          unxz frida-arm64.so.xz
-          mkdir -p decoded/lib/arm64-v8a
-          mv frida-arm64.so decoded/lib/arm64-v8a/libfrida-gadget.so
-          ls -lh decoded/lib/arm64-v8a/libfrida-gadget.so
+          find extracted -type f -name "*.apk" -print
 
-      # ── STEP 3b: Frida gadget (armeabi-v7a) ───────────────────────────────────
-      - name: Download Frida gadget (armeabi-v7a)
+      # ─────────────────────────────────────────────────────────────
+      # Identify base APK
+      # ─────────────────────────────────────────────────────────────
+      - name: Identify base APK
         run: |
-          curl -sL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gadget-${FRIDA_VERSION}-android-arm.so.xz" \
-               -o frida-arm.so.xz || true
-          if [ -f frida-arm.so.xz ]; then
-            unxz frida-arm.so.xz
-            mkdir -p decoded/lib/armeabi-v7a
-            mv frida-arm.so decoded/lib/armeabi-v7a/libfrida-gadget.so
-            echo "arm gadget placed"
+          BASE_APK=$(find extracted -maxdepth 1 -type f -name "*.apk" \
+            ! -name "*config*" \
+            | head -n 1)
+
+          if [ -z "$BASE_APK" ]; then
+            echo "::error::Could not identify base APK."
+            exit 1
           fi
 
-      # ── STEP 4: No-pause config ────────────────────────────────────────────────
-      - name: Write Frida no-pause config
+          echo "BASE_APK=$BASE_APK" >> "$GITHUB_ENV"
+
+          echo "Base APK:"
+          echo "$BASE_APK"
+
+      # ─────────────────────────────────────────────────────────────
+      # Decode base APK
+      #
+      # Only the base APK is decoded/rebuilt here.
+      # Configuration splits are preserved as-is.
+      # ─────────────────────────────────────────────────────────────
+      - name: Decode base APK
         run: |
-          cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so << 'JSON'
-          {
-            "interaction": {
-              "type": "listen",
-              "address": "127.0.0.1",
-              "port": 27042,
-              "on_load": "resume"
-            }
-          }
-          JSON
-          if [ -d decoded/lib/armeabi-v7a ]; then
-            cp decoded/lib/arm64-v8a/libfrida-gadget.config.so decoded/lib/armeabi-v7a/
-          fi
-          echo "Config written."
+          rm -rf decoded
 
-      # ── STEP 5: Smali injection ────────────────────────────────────────────────
-      - name: Install androguard
-        run: pip install androguard --quiet
+          apktool d \
+            "$BASE_APK" \
+            -f \
+            -o decoded
 
-      - name: Auto-inject System.loadLibrary into Smali
+      # ─────────────────────────────────────────────────────────────
+      # Example safe modification point
+      #
+      # Add your own authorized application changes here.
+      # ─────────────────────────────────────────────────────────────
+      - name: Show decoded application
         run: |
-          python3 /dev/stdin << 'PYEOF'
-          import os
-          import sys
-          from androguard.core.apk import APK
+          echo "Decoded application:"
+          ls -lah decoded
 
-          DECODED = "decoded"
-          APK_PATH = os.environ["MITM_OUT"]
+          echo
+          echo "Manifest:"
+          sed -n '1,120p' decoded/AndroidManifest.xml
 
-          apk = APK(APK_PATH)
-
-          def smali_path(class_name, decoded_dir):
-              rel = class_name.replace(".", "/").lstrip("/") + ".smali"
-              for root, dirs, files in os.walk(decoded_dir):
-                  candidate = os.path.join(root, rel)
-                  if os.path.isfile(candidate):
-                      return candidate
-              return None
-
-          target_class = apk.get_attribute_value("application", "name") or ""
-          target_path = smali_path(target_class, DECODED) if target_class else None
-
-          if not target_path:
-              for act in apk.get_activities():
-                  p = smali_path(act, DECODED)
-                  if p:
-                      target_class = act
-                      target_path = p
-                      break
-
-          if not target_path:
-              print("[-] No suitable Smali found — skipping injection")
-              print("    Activities:", apk.get_activities())
-              sys.exit(0)
-
-          print(f"[+] Target: {target_path}")
-          print(f"[+] Class:  {target_class}")
-
-          lines = open(target_path).readlines()
-
-          if "frida-gadget" in "".join(lines):
-              print("[*] Already injected — skipping")
-              sys.exit(0)
-
-          insert_idx = -1
-          i = 0
-
-          while i < len(lines):
-              line = lines[i].strip()
-              if line.startswith(".method") and ("onCreate(" in line or "<init>" in line):
-                  j = i + 1
-                  while j < len(lines) and not lines[j].strip().startswith(".end method"):
-                      s = lines[j].strip()
-                      if s.startswith(".locals 0"):
-                          lines[j] = lines[j].replace(".locals 0", ".locals 1")
-                          insert_idx = j + 1
-                          break
-                      if "invoke-super" in s and "onCreate" in s:
-                          insert_idx = j + 1
-                          break
-                      j += 1
-                  if insert_idx == -1:
-                      insert_idx = i + 1
-              if insert_idx != -1:
-                  break
-              i += 1
-
-          if insert_idx == -1:
-              print("[-] No insertion point found — skipping")
-              sys.exit(0)
-
-          injection = [
-              '    const-string v0, "frida-gadget"\n',
-              '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n',
-          ]
-
-          lines[insert_idx:insert_idx] = injection
-          open(target_path, "w").writelines(lines)
-
-          print("[+] Smali injection successful")
-          PYEOF
-
-      # Remaining steps unchanged...
-      # ── STEP 6: Manifest ──────────────────────────────────────────────────────
-      - name: Patch AndroidManifest.xml
+      # ─────────────────────────────────────────────────────────────
+      # Rebuild base APK
+      # ─────────────────────────────────────────────────────────────
+      - name: Rebuild base APK
         run: |
-          MANIFEST="decoded/AndroidManifest.xml"
-          # extractNativeLibs false → true
-          sed -i 's/android:extractNativeLibs="false"/android:extractNativeLibs="true"/g' "$MANIFEST" || true
-          # Add flag if missing entirely
-          if ! grep -q 'extractNativeLibs' "$MANIFEST"; then
-            sed -i 's/<application /<application android:extractNativeLibs="true" /g' "$MANIFEST" || true
+          apktool b \
+            decoded \
+            -o rebuilt-base-unsigned.apk
+
+          ls -lh rebuilt-base-unsigned.apk
+
+      # ─────────────────────────────────────────────────────────────
+      # Align base APK
+      # ─────────────────────────────────────────────────────────────
+      - name: Align base APK
+        run: |
+          zipalign \
+            -f \
+            -p \
+            4 \
+            rebuilt-base-unsigned.apk \
+            rebuilt-base-aligned.apk
+
+          zipalign -c -P 4 -v 4 rebuilt-base-aligned.apk
+
+      # ─────────────────────────────────────────────────────────────
+      # Prepare signing key
+      # ─────────────────────────────────────────────────────────────
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is missing."
+            exit 1
           fi
-          # INTERNET permission
-          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
-            sed -i '/<\/manifest>/i \    <uses-permission android:name="android.permission.INTERNET" />' "$MANIFEST"
-          fi
-          echo "Manifest patched."
 
-      # ── STEP 7: Rebuild ───────────────────────────────────────────────────────
-      - name: Rebuild APK
-        run: apktool b decoded -o repackaged-unsigned.apk
+          echo "$KEYSTORE_BASE64" | base64 --decode > signing.keystore
 
-      # ── STEP 8: Align ─────────────────────────────────────────────────────────
-      - name: Align APK
-        run: zipalign -v -f 4 repackaged-unsigned.apk aligned.apk
+          chmod 600 signing.keystore
 
-      # ── STEP 9: Sign ──────────────────────────────────────────────────────────
-      - name: Decode keystore
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > my.keystore
+          keytool -list \
+            -keystore signing.keystore \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            >/dev/null
 
-      - name: Sign APK
+          echo "Keystore verified."
+
+      # ─────────────────────────────────────────────────────────────
+      # Sign base APK
+      # ─────────────────────────────────────────────────────────────
+      - name: Sign base APK
         env:
           KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
           KS_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           apksigner sign \
-            --ks my.keystore \
+            --ks signing.keystore \
             --ks-key-alias "$KS_ALIAS" \
-            --ks-pass pass:"$KS_PASS" \
+            --ks-pass "pass:$KS_PASS" \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
-            aligned.apk
+            rebuilt-base-aligned.apk
 
-      # ── STEP 10: Verify ───────────────────────────────────────────────────────
-      - name: Verify signed APK
-        run: apksigner verify -v aligned.apk
+      # ─────────────────────────────────────────────────────────────
+      # Verify base APK
+      # ─────────────────────────────────────────────────────────────
+      - name: Verify signed base APK
+        run: |
+          apksigner verify -v rebuilt-base-aligned.apk
 
-      # ── Upload ────────────────────────────────────────────────────────────────
-      - name: Upload final patched APK
+      # ─────────────────────────────────────────────────────────────
+      # Create final APKS directory
+      # ─────────────────────────────────────────────────────────────
+      - name: Prepare final APKS
+        run: |
+          rm -rf final-apks
+          mkdir -p final-apks
+
+          # Copy rebuilt/signed base APK
+          cp rebuilt-base-aligned.apk final-apks/base.apk
+
+          # Copy configuration splits unchanged
+          find extracted -maxdepth 1 -type f -name "*.apk" \
+            -name "*config*" \
+            -exec cp {} final-apks/ \;
+
+          echo "Final APKS contents:"
+          ls -lh final-apks
+
+      # ─────────────────────────────────────────────────────────────
+      # Repackage as .apks
+      # ─────────────────────────────────────────────────────────────
+      - name: Create APKS archive
+        run: |
+          rm -f patched.apks
+
+          cd final-apks
+
+          zip -9 -r \
+            ../patched.apks \
+            *.apk
+
+          cd ..
+
+          echo
+          echo "Created:"
+          ls -lh patched.apks
+
+      # ─────────────────────────────────────────────────────────────
+      # Validate APKS archive
+      # ─────────────────────────────────────────────────────────────
+      - name: Validate final APKS
+        run: |
+          echo "Archive contents:"
+          unzip -l patched.apks
+
+          echo
+          echo "APK files:"
+          unzip -Z1 patched.apks | grep '\.apk$'
+
+          APK_COUNT=$(unzip -Z1 patched.apks | grep -c '\.apk$')
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::Final APKS contains no APK files."
+            exit 1
+          fi
+
+          echo
+          echo "Final APKS contains $APK_COUNT APK files."
+
+      # ─────────────────────────────────────────────────────────────
+      # Upload artifact
+      # ─────────────────────────────────────────────────────────────
+      - name: Upload patched APKS
         uses: actions/upload-artifact@v4
         with:
-          name: frida-patched-apk
-          path: aligned.apk
+          name: patched-apks
+          path: patched.apks
+          if-no-files-found: error
+          retention-days: 7
+
+      # ─────────────────────────────────────────────────────────────
+      # Upload individual APKs as optional artifact
+      # ─────────────────────────────────────────────────────────────
+      - name: Upload individual APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-apk-splits
+          path: final-apks/*.apk
+          if-no-files-found: error
           retention-days: 7
